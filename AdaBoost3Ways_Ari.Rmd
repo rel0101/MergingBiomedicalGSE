@@ -1,0 +1,405 @@
+```{r load_packages, message= FALSE, warning = FALSE}
+library(GEOquery)
+library(R.utils)
+library(gridExtra)
+library(reshape2)
+library(ggplot2)
+library(limma)
+library(dplyr)
+library(DT)
+library(plotly)
+library(stringr)
+library(tidyr)
+library(DT)
+library(reshape2)
+library(RColorBrewer)
+library(cvTools)
+library(stringr)
+library(FSelector)
+library(ada)
+library(caret)
+library(pROC)
+```
+
+```{r gse1}
+
+gse1 <- getGEO('GSE28146')
+gse1 <- gse1$GSE28146_series_matrix.txt.gz
+
+
+```
+
+```{r features1}
+  
+#### Features ####
+
+features1 <- gse1@featureData@data
+
+#isolating gene_codes
+
+features1 <- features1 %>% mutate(gene_codes = str_trim(str_extract(.[["Gene Symbol"]], "^[^/]+")))
+
+#summarising the featdf to only the important variables 
+
+features1 <- features1 %>% select(GB_ACC,ID,gene_codes) #test models with the remaining 3 columns left out
+
+############################
+```
+
+```{r Phenotypes1}
+
+
+#### Phenotypes ####
+
+
+phenotypes1 <- gse1@phenoData@data
+
+#sex 
+
+phenotypes1$sex <- str_extract(phenotypes1$characteristics_ch1, "(?<=Sex: ).*")
+
+#age cleaning 
+
+phenotypes1$age <- as.numeric(str_extract(phenotypes1$characteristics_ch1.1, "[0-9]+"))
+
+#outcome
+
+phenotypes1$outcome <- str_extract(phenotypes1$characteristics_ch1.2, "(?<=disease status: ).*")
+
+phenotypes1$outcome <- ifelse(
+  str_detect(phenotypes1$characteristics_ch1.2, "Control"),
+  "Control",
+  "AD"
+)
+
+#Simplify the frame
+phenotypes1 <- phenotypes1 %>% select(geo_accession,age,sex,outcome)
+
+```
+
+```{r eMat1}
+#eMat
+
+eMat1 <- exprs(gse1)
+rownames(eMat1) <- features1$gene_codes
+
+```
+
+
+```{r LoadingGSE2}
+gse2 <- getGEO("GSE66351")
+gse2 <- gse2$GSE66351_series_matrix.txt.gz
+```
+
+
+```{r features2}
+  
+#### Features ####
+
+features2 <- gse2@featureData@data
+
+#gene_codes and cleaning
+features2$gene_codes <- gsub(";.*", "", features2$UCSC_RefGene_Name)
+
+features2 <- features2[!is.na(features2$gene_codes), ]
+features2 <- features2[!is.na(features2$gene_codes) & features2$gene_codes != "", ]
+
+#selecct important
+features2 <- features2 %>% select(ID,gene_codes) 
+
+############################
+```
+
+```{r Phenotypes2}
+
+
+#### Phenotypes ####
+
+  
+phenotypes2 <- gse2@phenoData@data
+
+#sex 
+
+phenotypes2$sex <- str_extract(phenotypes2$characteristics_ch1.5, "(?<=Sex: ).*")
+
+
+phenotypes2$sex <- ifelse(
+  str_detect(phenotypes2$sex, "F"),
+  "Female",
+  "Male"
+)
+
+
+#age cleaning 
+
+phenotypes2$age <- as.numeric(phenotypes2$`age:ch1`)
+
+#outcome
+
+
+phenotypes2$outcome <- ifelse(
+  str_detect(phenotypes2$'diagnosis:ch1', "CTRL"),
+  "Control",
+  "AD"
+  
+)
+
+
+#Control      AD 
+#     92     128 
+
+
+#Simplify the frame
+phenotypes2 <- phenotypes2 %>% select(geo_accession,age,sex,outcome)
+
+```
+
+```{r eMat2}
+#eMat
+
+eMat2 <- exprs(gse2)
+eMat2 <- eMat2[features2$ID, ]
+rownames(eMat2) <- features2$gene_codes
+
+```
+
+
+```{r COMBINE}
+
+combined_features <- bind_rows(features1, features2)
+
+combined_phenotypes <- bind_rows(phenotypes1, phenotypes2)
+
+common_genes <- intersect(rownames(eMat1), rownames(eMat2))
+eMat1_common <- eMat1[common_genes, ]
+eMat2_common <- eMat2[common_genes, ]
+combined_eMat <- cbind(eMat1_common, eMat2_common)
+
+```
+
+```{r outcomeasfactor}
+# First, check and fix the outcome variable
+print("Structure of combined phenotypes:")
+str(combined_phenotypes)
+
+# Convert outcome to factor with proper levels
+if (!is.factor(combined_phenotypes$outcome)) {
+  print("Converting outcome to factor with Control as reference level")
+  combined_phenotypes$outcome <- factor(combined_phenotypes$outcome, levels=c("Control", "AD"))
+}
+
+# Verify the factor levels
+print("Levels of outcome variable after conversion:")
+print(levels(combined_phenotypes$outcome))
+
+# Check class balance
+print("Class distribution:")
+table(combined_phenotypes$outcome)
+```
+
+Limma method: Using differential expression analysis with limma to find genes that differ significantly between AD and Control groups.
+
+Information Gain method: Using information theory to identify genes with the highest information content for distinguishing between outcome classes.
+
+PCA method: Using Principal Component Analysis to find genes that contribute most to the top principal components (the most variance in the data).
+
+```{r Top100GenesLimma}
+
+# Using limma for differential expression
+
+# Make sure outcome is a factor with Control as reference level
+outcome <- factor(combined_phenotypes$outcome, levels=c("Control", "AD"))
+
+# Create design matrix
+design <- model.matrix(~outcome)
+
+# Fit model
+fit <- lmFit(combined_eMat, design)
+fit <- eBayes(fit)
+
+# Get top differentially expressed genes
+results <- topTable(fit, coef="outcomeAD", number=100, sort.by="p")
+top_limma_genes <- rownames(results)
+
+# Create matrix with selected genes, transpose so samples are rows
+X <- t(combined_eMat[top_limma_genes, ])
+X_scaled <- scale(X)  # Scale the data *STANDARDISES FOR u=0, stdev = 1
+
+head(top_limma_genes)
+results
+```
+
+```{r Top100GenesInfoGain}
+
+library(FSelector)
+
+# Convert expression data to data frame with outcome
+df <- data.frame(t(combined_eMat)) #IF YOU HAVENT ALREADY TRANSPOSED!!!
+df$outcome <- outcome #MAKE SURE THIS IS SET AS FACTOR 
+
+# Calculate information gain
+weights <- information.gain(outcome ~ ., df)
+top_ig_genes <- rownames(combined_eMat)[head(order(weights$attr_importance, decreasing=TRUE), 100)]
+
+```
+
+```{r Top100GenesPCA}
+print("Performing PCA analysis...")
+# PCA
+pca_result <- prcomp(t(combined_eMat), scale=TRUE)
+
+# Extract top genes contributing to first few PCs
+loadings <- abs(pca_result$rotation[,1:3])
+contrib <- rowSums(loadings)
+top_pca_genes <- names(sort(contrib, decreasing=TRUE))[1:100]
+
+print("Top 10 PCA genes:")
+print(head(top_pca_genes, 10))
+print("Contribution values of top 10 PCA genes:")
+print(head(sort(contrib, decreasing=TRUE), 10))
+```
+
+```{r limmaADABOOST}
+library(adabag)
+library(caret)
+
+# Verify combined phenotypes structure
+print(dim(combined_phenotypes))  # Expect 220 rows, check columns
+print(str(combined_phenotypes$outcome))  # Ensure "Control" and "AD" are recognized correctly
+print(table(combined_phenotypes$outcome))  # Check class distribution
+
+# Prepare data
+X <- t(combined_eMat[top_limma_genes, ])  # Transpose so samples are rows
+X_scaled <- scale(X)  # Standardize for better model performance
+y <- combined_phenotypes$outcome  # Outcome labels
+
+# Convert outcome to numeric (required for AdaBoost)
+y_numeric <- as.numeric(y) - 1  # Convert "Control"=0, "AD"=1
+print(length(y_numeric))  # Ensure correct number of samples
+
+# Split data (80% train, 20% test)
+set.seed(42)
+sample_size <- floor(0.8 * length(y_numeric))
+train_indices <- sample(seq_len(length(y_numeric)), size=sample_size)
+
+X_train <- X_scaled[train_indices, ]
+y_train <- y_numeric[train_indices]
+X_test <- X_scaled[-train_indices, ]
+y_test <- y_numeric[-train_indices]
+
+# Verify split integrity
+print(dim(X_train))  # Ensure samples and features match
+print(length(y_train))  # Should match X_train rows
+print(table(y_train))  # Check class balance
+print(table(y_test))  # Check test set distribution
+
+# Prepare training data
+train_data <- data.frame(label = factor(y_train, levels = c(0,1)), X_train)
+
+# Train AdaBoost model
+boost_model <- boosting(label ~ ., data=train_data, mfinal=50)
+
+# Predictions
+pred <- predict(boost_model, newdata=data.frame(X_test))
+
+# Evaluate model performance
+conf_matrix <- confusionMatrix(factor(pred$class), factor(y_test))
+print(conf_matrix)
+```
+
+
+```{r }
+library(adabag)
+library(caret)
+
+# Verify combined phenotypes structure
+print(dim(combined_phenotypes))  # Expect 220 rows, check columns
+print(str(combined_phenotypes$outcome))  # Ensure "Control" and "AD" are recognized correctly
+print(table(combined_phenotypes$outcome))  # Check class distribution
+
+# Prepare data
+X <- t(combined_eMat[top_ig_genes, ])  # Transpose so samples are rows
+X_scaled <- scale(X)  # Standardize for better model performance
+y <- combined_phenotypes$outcome  # Outcome labels
+
+# Convert outcome to numeric (required for AdaBoost)
+y_numeric <- as.numeric(y) - 1  # Convert "Control"=0, "AD"=1
+print(length(y_numeric))  # Ensure correct number of samples
+
+# Split data (80% train, 20% test)
+set.seed(42)
+sample_size <- floor(0.8 * length(y_numeric))
+train_indices <- sample(seq_len(length(y_numeric)), size=sample_size)
+
+X_train <- X_scaled[train_indices, ]
+y_train <- y_numeric[train_indices]
+X_test <- X_scaled[-train_indices, ]
+y_test <- y_numeric[-train_indices]
+
+# Verify split integrity
+print(dim(X_train))  # Ensure samples and features match
+print(length(y_train))  # Should match X_train rows
+print(table(y_train))  # Check class balance
+print(table(y_test))  # Check test set distribution
+
+# Prepare training data
+train_data <- data.frame(label = factor(y_train, levels = c(0,1)), X_train)
+
+# Train AdaBoost model
+boost_model <- boosting(label ~ ., data=train_data, mfinal=50)
+
+# Predictions
+pred <- predict(boost_model, newdata=data.frame(X_test))
+
+# Evaluate model performance
+conf_matrix <- confusionMatrix(factor(pred$class), factor(y_test))
+print(conf_matrix)
+```
+
+```{r pcaADABOOST}
+library(adabag)
+library(caret)
+
+# Verify combined phenotypes structure
+print(dim(combined_phenotypes))  # Expect 220 rows, check columns
+print(str(combined_phenotypes$outcome))  # Ensure "Control" and "AD" are recognized correctly
+print(table(combined_phenotypes$outcome))  # Check class distribution
+
+# Prepare data
+X <- t(combined_eMat[top_pca_genes, ])  # Transpose so samples are rows
+X_scaled <- scale(X)  # Standardize for better model performance
+y <- combined_phenotypes$outcome  # Outcome labels
+
+# Convert outcome to numeric (required for AdaBoost)
+y_numeric <- as.numeric(y) - 1  # Convert "Control"=0, "AD"=1
+print(length(y_numeric))  # Ensure correct number of samples
+
+# Split data (80% train, 20% test)
+set.seed(42)
+sample_size <- floor(0.8 * length(y_numeric))
+train_indices <- sample(seq_len(length(y_numeric)), size=sample_size)
+
+X_train <- X_scaled[train_indices, ]
+y_train <- y_numeric[train_indices]
+X_test <- X_scaled[-train_indices, ]
+y_test <- y_numeric[-train_indices]
+
+# Verify split integrity
+print(dim(X_train))  # Ensure samples and features match
+print(length(y_train))  # Should match X_train rows
+print(table(y_train))  # Check class balance
+print(table(y_test))  # Check test set distribution
+
+# Prepare training data
+train_data <- data.frame(label = factor(y_train, levels = c(0,1)), X_train)
+
+# Train AdaBoost model
+boost_model <- boosting(label ~ ., data=train_data, mfinal=50)
+
+# Predictions
+pred <- predict(boost_model, newdata=data.frame(X_test))
+
+# Evaluate model performance
+conf_matrix <- confusionMatrix(factor(pred$class), factor(y_test))
+print(conf_matrix)
+```
